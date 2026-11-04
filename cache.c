@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-typedef enum { POLICY_LRU, POLICY_FIFO, POLICY_LFU } Policy;
+typedef enum { POLICY_LRU, POLICY_FIFO, POLICY_LFU, POLICY_ARC } Policy;
 
 typedef struct {
     bool valid;
@@ -12,10 +12,22 @@ typedef struct {
     uint64_t last_access_time;
     uint64_t insertion_time;
     uint64_t access_count;
+    bool is_t2; // False = T1 (recency), True = T2 (frequency)
 } CacheLine;
 
 typedef struct {
+    bool valid;
+    uint64_t tag;
+    uint64_t time;
+} GhostLine;
+
+typedef struct {
     CacheLine *lines;
+    GhostLine *b1; // Ghost list B1 (evicted from T1)
+    GhostLine *b2; // Ghost list B2 (evicted from T2)
+    int b1_count;
+    int b2_count;
+    double p;      // Target size for T1
 } CacheSet;
 
 typedef struct {
@@ -26,12 +38,10 @@ typedef struct {
     Policy policy;
     CacheSet *sets;
     
-    // Global Telemetry
     uint64_t total_accesses;
     uint64_t total_hits;
     uint64_t total_misses;
     
-    // Sliding Window Telemetry[cite: 5, 6]
     uint32_t window_size;
     uint32_t window_hits;
     uint32_t window_misses;
@@ -54,11 +64,16 @@ Cache* cache_create(uint32_t capacity, uint32_t block_size, uint32_t associativi
     c->sets = (CacheSet*) malloc(sizeof(CacheSet) * c->num_sets);
     for (uint32_t i = 0; i < c->num_sets; i++) {
         c->sets[i].lines = (CacheLine*) calloc(associativity, sizeof(CacheLine));
+        c->sets[i].b1 = (GhostLine*) calloc(associativity, sizeof(GhostLine));
+        c->sets[i].b2 = (GhostLine*) calloc(associativity, sizeof(GhostLine));
+        c->sets[i].b1_count = 0;
+        c->sets[i].b2_count = 0;
+        c->sets[i].p = 0.0;
     }
     return c;
 }
 
-int select_victim(Cache *c, uint32_t set_idx) {
+int select_victim_standard(Cache *c, uint32_t set_idx) {
     CacheSet *set = &c->sets[set_idx];
     int victim = 0;
     
@@ -90,15 +105,152 @@ int select_victim(Cache *c, uint32_t set_idx) {
     return victim;
 }
 
+void arc_replace(Cache *c, uint32_t set_idx, bool hit_in_b2) {
+    CacheSet *set = &c->sets[set_idx];
+    int t1_count = 0;
+    for (uint32_t i = 0; i < c->associativity; i++) {
+        if (set->lines[i].valid && !set->lines[i].is_t2) t1_count++;
+    }
+
+    int victim = -1;
+    bool victim_from_t1 = false;
+
+    if (t1_count > 0 && ((t1_count > set->p) || (hit_in_b2 && t1_count == (int)set->p))) {
+        uint64_t min_time = UINT64_MAX;
+        for (uint32_t i = 0; i < c->associativity; i++) {
+            if (set->lines[i].valid && !set->lines[i].is_t2) {
+                if (set->lines[i].last_access_time < min_time) {
+                    min_time = set->lines[i].last_access_time;
+                    victim = i;
+                }
+            }
+        }
+        victim_from_t1 = true;
+    } else {
+        uint64_t min_time = UINT64_MAX;
+        for (uint32_t i = 0; i < c->associativity; i++) {
+            if (set->lines[i].valid && set->lines[i].is_t2) {
+                if (set->lines[i].last_access_time < min_time) {
+                    min_time = set->lines[i].last_access_time;
+                    victim = i;
+                }
+            }
+        }
+        if (victim == -1) {
+            uint64_t min_t = UINT64_MAX;
+            for (uint32_t i = 0; i < c->associativity; i++) {
+                if (set->lines[i].valid && set->lines[i].last_access_time < min_t) {
+                    min_t = set->lines[i].last_access_time;
+                    victim = i;
+                }
+            }
+            victim_from_t1 = !set->lines[victim].is_t2;
+        }
+    }
+
+    if (victim != -1 && set->lines[victim].valid) {
+        GhostLine *ghost_list = victim_from_t1 ? set->b1 : set->b2;
+        int *g_count = victim_from_t1 ? &set->b1_count : &set->b2_count;
+
+        if (*g_count >= (int)c->associativity) {
+            int oldest = 0;
+            uint64_t min_t = ghost_list[0].time;
+            for (int i = 1; i < *g_count; i++) {
+                if (ghost_list[i].time < min_t) {
+                    min_t = ghost_list[i].time;
+                    oldest = i;
+                }
+            }
+            ghost_list[oldest].tag = set->lines[victim].tag;
+            ghost_list[oldest].time = c->total_accesses;
+            ghost_list[oldest].valid = true;
+        } else {
+            ghost_list[*g_count].tag = set->lines[victim].tag;
+            ghost_list[*g_count].time = c->total_accesses;
+            ghost_list[*g_count].valid = true;
+            (*g_count)++;
+        }
+
+        set->lines[victim].valid = false;
+    }
+}
+
+bool cache_access_arc(Cache *c, uint32_t set_idx, uint64_t tag, FILE *csv_out) {
+    CacheSet *set = &c->sets[set_idx];
+    
+    for (uint32_t i = 0; i < c->associativity; i++) {
+        if (set->lines[i].valid && set->lines[i].tag == tag) {
+            c->total_hits++;
+            c->window_hits++;
+            set->lines[i].last_access_time = c->total_accesses;
+            set->lines[i].access_count++;
+            set->lines[i].is_t2 = true;
+            return true;
+        }
+    }
+
+    c->total_misses++;
+    c->window_misses++;
+
+    int b1_idx = -1, b2_idx = -1;
+    for (int i = 0; i < set->b1_count; i++) {
+        if (set->b1[i].valid && set->b1[i].tag == tag) { b1_idx = i; break; }
+    }
+    for (int i = 0; i < set->b2_count; i++) {
+        if (set->b2[i].valid && set->b2[i].tag == tag) { b2_idx = i; break; }
+    }
+
+    if (b1_idx != -1) {
+        double delta = (set->b2_count >= set->b1_count) ? 1.0 : ((double)set->b2_count / set->b1_count);
+        set->p += delta;
+        if (set->p > c->associativity) set->p = c->associativity;
+        set->b1[b1_idx].valid = false;
+        arc_replace(c, set_idx, false);
+    } else if (b2_idx != -1) {
+        double delta = (set->b1_count >= set->b2_count) ? 1.0 : ((double)set->b1_count / set->b2_count);
+        set->p -= delta;
+        if (set->p < 0.0) set->p = 0.0;
+        set->b2[b2_idx].valid = false;
+        arc_replace(c, set_idx, true);
+    } else {
+        int valid_count = 0;
+        for (uint32_t i = 0; i < c->associativity; i++) {
+            if (set->lines[i].valid) valid_count++;
+        }
+        if (valid_count >= (int)c->associativity) {
+            arc_replace(c, set_idx, false);
+        }
+    }
+
+    int empty_slot = -1;
+    for (uint32_t i = 0; i < c->associativity; i++) {
+        if (!set->lines[i].valid) { empty_slot = i; break; }
+    }
+    if (empty_slot != -1) {
+        set->lines[empty_slot].valid = true;
+        set->lines[empty_slot].tag = tag;
+        set->lines[empty_slot].last_access_time = c->total_accesses;
+        set->lines[empty_slot].insertion_time = c->total_accesses;
+        set->lines[empty_slot].access_count = 1;
+        set->lines[empty_slot].is_t2 = (b1_idx != -1 || b2_idx != -1);
+    }
+
+    return false;
+}
+
 bool cache_access(Cache *c, uint64_t addr, FILE *csv_out) {
     c->total_accesses++;
     uint64_t block_addr = addr / c->block_size;
     uint32_t set_idx = block_addr % c->num_sets;
     uint64_t tag = block_addr / c->num_sets;
     
+    if (c->policy == POLICY_ARC) {
+        cache_access_arc(c, set_idx, tag, csv_out);
+        goto log_step;
+    }
+
     CacheSet *set = &c->sets[set_idx];
     
-    // Check for Hit
     for (uint32_t i = 0; i < c->associativity; i++) {
         if (set->lines[i].valid && set->lines[i].tag == tag) {
             c->total_hits++;
@@ -109,11 +261,9 @@ bool cache_access(Cache *c, uint64_t addr, FILE *csv_out) {
         }
     }
     
-    // Miss Handling
     c->total_misses++;
     c->window_misses++;
     
-    // Find Invalid Line or Evict Victim
     int target_slot = -1;
     for (uint32_t i = 0; i < c->associativity; i++) {
         if (!set->lines[i].valid) {
@@ -123,10 +273,9 @@ bool cache_access(Cache *c, uint64_t addr, FILE *csv_out) {
     }
     
     if (target_slot == -1) {
-        target_slot = select_victim(c, set_idx);
+        target_slot = select_victim_standard(c, set_idx);
     }
     
-    // Insert Line
     set->lines[target_slot].valid = true;
     set->lines[target_slot].tag = tag;
     set->lines[target_slot].last_access_time = c->total_accesses;
@@ -134,7 +283,6 @@ bool cache_access(Cache *c, uint64_t addr, FILE *csv_out) {
     set->lines[target_slot].access_count = 1;
 
 log_step:
-    // Log sliding window telemetry[cite: 5, 6]
     if (csv_out && (c->total_accesses % c->window_size == 0)) {
         double window_wmr = (double)c->window_misses / c->window_size;
         fprintf(csv_out, "%lu,%.4f\n", c->total_accesses, window_wmr);
@@ -146,7 +294,7 @@ log_step:
 
 int main(int argc, char **argv) {
     if (argc < 7) {
-        printf("Usage: %s <trace_file> <capacity_bytes> <assoc> <policy: LRU|FIFO|LFU> <window_size> <output_csv>\n", argv[0]);
+        printf("Usage: %s <trace_file> <capacity_bytes> <assoc> <policy: LRU|FIFO|LFU|ARC> <window_size> <output_csv>\n", argv[0]);
         return 1;
     }
 
@@ -160,6 +308,7 @@ int main(int argc, char **argv) {
     Policy policy = POLICY_LRU;
     if (strcmp(pol_str, "FIFO") == 0) policy = POLICY_FIFO;
     else if (strcmp(pol_str, "LFU") == 0) policy = POLICY_LFU;
+    else if (strcmp(pol_str, "ARC") == 0) policy = POLICY_ARC;
 
     Cache *cache = cache_create(capacity, 64, assoc, policy, window_size);
 
