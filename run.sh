@@ -6,7 +6,8 @@ python3 traces.py
 
 mkdir -p results figures
 
-CAPACITY=32768   # 32 KB Cache
+#CAPACITY=32768   # 32 KB Cache
+CAPACITY=16384   # 16 KB Cache (matches single working set size)
 ASSOC=8          # 8-way associative
 WINDOW=100       # Sliding window size Delta_t
 
