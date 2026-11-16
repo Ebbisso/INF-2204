@@ -17,4 +17,4 @@ Compile and generate traces:
 ```./run.sh```
 
 Generate figures:
-```python3 plot.py````
+```python3 plot.py```
